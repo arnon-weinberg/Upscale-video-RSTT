@@ -1,0 +1,93 @@
+#!/bin/sh
+# This script attempts to install PyTorch in a virtual environment (local
+# directory = ./pytorch).  It will try the pip installer by default, but if
+# that fails, then try the conda installer instead:
+# >rm -rf pytorch
+# >env installer=conda setup
+# Root is not required, and all changes are local, so uninstalling
+# the project is a simple matter of removing its directory.
+
+cd $(dirname ${0})
+
+if [[ -e "pytorch/bin/activate" ]]
+then
+  source pytorch/bin/activate
+else
+  echo "Setting up a virtual environment for PyTorch..."
+  echo
+
+  if [[ "$installer" == "conda" ]]
+  then
+    # Install via conda:
+    if ! ls pytorch/*.sh >/dev/null 2>&1
+    then
+      mkdir -p pytorch
+      # Note: If this is the wrong link, then please download Miniconda
+      # manually and try again...
+      wget -P pytorch https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+    fi
+
+    sh pytorch/*.sh -b -p pytorch -f
+    rm pytorch/*.sh
+    source pytorch/bin/activate
+  else
+    # Install via pip:
+    python3 -m venv pytorch
+    source pytorch/bin/activate
+    pip --no-cache-dir install --upgrade pip
+  fi
+  echo
+fi
+
+if [[ "$CONDA_DEFAULT_ENV" ]]
+then
+  installer=conda
+else
+  installer=pip
+fi
+echo "Installing PyTorch - using $installer installer..."
+echo
+
+if [[ "$installer" == "pip" ]]
+then
+  # Install via pip:
+  pip --no-cache-dir install -r requirements.txt
+else
+  # Install via conda:
+  cat <<EOF >pytorch/requirements.txt
+python=3.8.11
+cudatoolkit=11.4
+pytorch=1.9.0
+python-lmdb=1.2.1
+lpips=0.1.4
+matplotlib=3.4.3
+numpy=1.20.3
+opencv=4.5.3.56
+PyYAML=6.0
+scikit-image=0.18.3
+tensorboardX=2.5
+timm=0.4.12
+EOF
+
+  conda install -y -c conda-forge --file pytorch/requirements.txt
+  # Conda installs FFmpeg with x264 disabled :-(
+  mv pytorch/bin/ffmpeg pytorch/bin/ffmpeg.conda
+fi
+# Check results using:
+# >python -c 'from torch.utils.collect_env import main; main()'
+echo
+
+# Attempt to run the script:
+upscale --help
+echo
+
+# ffmpeg is optional; used for extracting frames from video files.
+if ! which ffmpeg >/dev/null 2>&1
+then
+  echo "Just noting that ffmpeg is not found."
+  echo
+fi
+
+echo "If there are no errors, then setup completed successfully.  Now run:"
+echo ">source $(dirname ${0})/pytorch/bin/activate"
+echo ">$(dirname ${0})/upscale --help"

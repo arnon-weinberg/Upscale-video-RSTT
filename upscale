@@ -1,0 +1,174 @@
+#!/usr/bin/env python
+# This script takes a directory of *.png input frame images, upscales them
+# using the RSTT model pre-trained weights, and dumps the resulting frame
+# images in the given output directory.
+#
+# >upscale --help
+
+#??? Support multiple scenes?
+#??? Once ffmpeg is upgraded: Test -frame_pts true (is it pts or pts_time?)
+#???                          -vsync is deprecated. Use -fps_mode
+#??? Bug: Always processes all images in directory regardless of --scene
+
+import argparse
+import sys, os, time
+import re, glob
+import torch
+import numpy
+import cv2
+from models import create_model
+from ffmpeg import ffmpeg_extract_frames, ffmpeg_replace_frames
+import functools
+print = functools.partial(print, flush=True) # Auto-flush output
+
+parser = argparse.ArgumentParser ( description = 'Super-resolution: Upscale and interpolate video using RSTT' )
+
+parser.add_argument ( 'input', help='input video file or frames directory' )
+parser.add_argument ( 'output', nargs='?', help='output frames directory' )
+parser.add_argument ( '--scene',
+                      metavar='[[HH:]MM:]SS[.ms]|# -/+ [[[HH:]MM:]SS[.ms]|#]',
+                      help='video file time or frame range' )
+parser.add_argument ( '--no-resume', dest='resume', action='store_false',
+                      help='overwrite existing output files' )
+parser.add_argument ( '--no-cuda', dest='cuda', action='store_false',
+                      help='use CPU even when GPU is available' )
+parser.add_argument ( '--model', dest='model', default='RSTT-S',
+                      choices=['RSTT-S','RSTT-M','RSTT-L'],
+                      help='model architecture variation [default=RSTT-S]' )
+parser.add_argument ( '--debug', type=int, choices=range(3), default=0 )
+
+opt = parser.parse_args()
+
+opt.zoom = 4 # Hard-coded for RSTT
+if opt.cuda: opt.cuda = torch.cuda.is_available()
+
+if opt.scene:
+  ts = '(?:(?:(?:\d+:)?[0-5]?\d):[0-5]?|0\d*)\d(?:\.\d*)?|(?:(?:(?:\d+:)?[0-5]?\d)?:[0-5]?|\d*)\d\.\d*'
+  opt.scene = re.search(
+      f"^(?:(?P<st>{ts})(?:-(?P<et1>{ts})|-(?P<ef1>\d+)"
+                      +f"|\+(?P<tf1>\d+)|\+(?P<tt>{ts})|[-+])?"
+         +f"|(?P<sf>\d+)(?:-(?P<et2>{ts})|-(?P<ef2>\d+)"
+                      +f"|\+(?P<tf2>\d+)|[-+])?)$", opt.scene)
+  if not opt.scene:
+    raise ValueError("--scene must be a valid time or frame range")
+  opt.scene = opt.scene.groupdict()
+  for v in ['et','ef','tf']:
+    opt.scene[v] = opt.scene[v+'1'] if opt.scene[v+'2'] is None \
+                                  else opt.scene[v+'2']
+    opt.scene.pop(v+'1',None)
+    opt.scene.pop(v+'2',None)
+
+input_dir = opt.input
+if   not os.path.exists ( input_dir ) or \
+     ( opt.scene and not os.path.isfile ( input_dir ) ):
+  raise FileNotFoundError(f"Input '{input_dir}' not found.")
+elif os.path.isfile ( input_dir ):
+  input_dir = os.path.join ( os.path.dirname ( input_dir ),
+                             '.'+os.path.basename ( input_dir )+'.inp' )
+else:
+  opt.input = re.sub (r'/$', '', opt.input )
+
+output_dir = opt.output
+if opt.output is not None and os.path.isfile ( opt.input ) and \
+   ( os.path.isfile ( opt.output ) or                          \
+     re.search(r'(^|/)[^.].*\.[^/]+$',opt.output) ):
+  output_dir = None
+else:
+  opt.output = ''
+if output_dir is None:
+  output_dir = os.path.join ( os.path.dirname ( opt.input ),
+                          '.'+os.path.basename ( opt.input )+'.out' )
+if input_dir == output_dir: opt.resume = False
+if opt.debug > 1: print('opt =', opt)
+
+if os.path.isfile ( opt.input ): # Extract frames using FFmpeg
+  ffmpeg_extract_frames(opt, input_dir)
+
+if not os.path.exists(output_dir): os.makedirs(output_dir)
+
+if opt.debug: print('Setting up model: RSTT')
+config = { 'model': 'RSTT',
+           'network': {
+             'embed_dim': 96,
+             'num_heads': [2,4,8,16,16,8,4,2],
+             'window_sizes': [[4,4],[4,4],[4,4],[4,4],[4,4],[4,4],[4,4],[4,4]],
+             'back_RBs': 0
+           } }
+pretrained_weights = ''
+if   opt.model == 'RSTT-S':
+  config['network']['depths'] = [4,4,4,4,4,4,4,4]
+  pretrained_weights = 'checkpoints/RSTT-S/f96d4w4h24816Ushape0res_1690000.pth'
+elif opt.model == 'RSTT-M':
+  config['network']['depths'] = [6,6,6,6,6,6,6,6]
+  pretrained_weights = 'checkpoints/RSTT-M/f96d6w4h24816Ushape0res_1622000.pth'
+else:           # 'RSTT-L':
+  config['network']['depths'] = [8,8,8,8,8,8,8,8]
+  pretrained_weights = 'checkpoints/RSTT-L/f96d8w4h24816Ushape0res_1610000.pth'
+model = create_model(config)
+
+pretrained_weights = os.path.join ( os.path.dirname ( sys.argv[0] ),
+                                    pretrained_weights )
+if opt.debug:
+  print(f"  Loading pre-trained weights: file = '{pretrained_weights}'")
+model.load_state_dict(torch.load(pretrained_weights), strict=True)
+
+model.eval()
+device = torch.device( 'cuda' if opt.cuda else 'cpu' )
+model = model.to(device)
+
+files = { 'inp': [], 'out': [] }
+for file in sorted(glob.glob(os.path.join(input_dir, '*.png'))):
+  files['inp'].append(file)
+  # Preset the destination file name:
+  out = os.path.join(output_dir, os.path.basename(file))
+  files['out'].append( '' if opt.resume and os.path.exists ( out ) else out )
+
+if opt.debug:
+  print(f"Processing {len(files['inp'])} frames in '{input_dir}'...")
+else:
+  print(f"Processing {len(files['inp'])} frames in '{input_dir}' ", end='')
+
+# Process image frames in batches of 7 (hard-coded context):
+f = min(7,len(files['inp'])+1)
+while f <= len(files['inp']):
+  batch = range(max(f-7,0),f)
+  f = f+1 if f >= len(files['inp']) else min(f+7,len(files['inp'])+1)-1
+
+  if not ''.join( files['out'][o] for o in batch ):
+    if opt.debug: print(f"  Skipping:"
+      +f" files = '{os.path.basename(files['inp'][batch[0]])}'"
+           +f" .. '{os.path.basename(files['inp'][batch[-1]])}' already exist")
+    else:
+      print('.', end='')
+    continue
+
+  if opt.debug: print(f"  Generating:"
+    +f" files = '{os.path.basename(files['inp'][batch[0]])}'"
+         +f" .. '{os.path.basename(files['inp'][batch[-1]])}'", end='')
+  t0 = time.time()
+
+  inputs = [ cv2.imread(files['inp'][i])[:,:,::-1] for i in batch ]
+  inputs = numpy.stack(inputs, axis=0)
+  inputs = inputs.astype(numpy.float32) / 255
+  inputs = torch.from_numpy(inputs).permute(0,3,1,2).contiguous()
+  inputs = inputs[::2].unsqueeze(0).to(device)
+  with torch.no_grad(): outputs = model ( inputs )
+  outputs = outputs.cpu().squeeze().clamp(0,1).numpy()
+
+  # Save image frames:
+  for i, o in enumerate(batch):
+    if not files['out'][o]: continue # Skip existing files
+
+    output = (outputs[i].squeeze().transpose((1,2,0)) \
+           * 255.0).round().astype(numpy.uint8)
+    cv2.imwrite(files['out'][o], output[...,::-1])
+    files['out'][o] = ''
+
+  if opt.debug:
+    print(f" ({time.time() - t0 :0.1f}s)")
+  else:
+    print('.', end='')
+if not opt.debug: print(' done.')
+
+if opt.output: # Replace frames using FFmpeg (experimental)
+  ffmpeg_replace_frames(opt, input_dir, output_dir)
