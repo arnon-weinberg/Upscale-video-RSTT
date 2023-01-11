@@ -1,8 +1,2 @@
-.ipynb_checkpoints
 __pycache__
-*.lmdb
-*.log
-*.png
-*.pkl
-*.txt
-*.state
+pytorch
