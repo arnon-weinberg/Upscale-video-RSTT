@@ -51,25 +51,26 @@ echo
 if [[ "$installer" == "pip" ]]
 then
   # Install via pip:
-  pip --no-cache-dir install -r requirements.txt
+  cat <<EOF >pytorch/requirements.txt
+#python<=3.8.11
+torch==1.9.0
+numpy<=1.20.3
+opencv_python==4.5.3.56
+timm==0.4.12
+EOF
+
+  pip --no-cache-dir install -r pytorch/requirements.txt
 else
   # Install via conda:
   cat <<EOF >pytorch/requirements.txt
-python=3.8.11
-cudatoolkit=11.4
+python<=3.8.11
 pytorch=1.9.0
-python-lmdb=1.2.1
-lpips=0.1.4
-matplotlib=3.4.3
-numpy=1.20.3
+numpy<=1.20.3
 opencv=4.5.3.56
-PyYAML=6.0
-scikit-image=0.18.3
-tensorboardX=2.5
 timm=0.4.12
 EOF
 
-  conda install -y -c conda-forge --file pytorch/requirements.txt
+  conda install -y --file pytorch/requirements.txt
   # Conda installs FFmpeg with x264 disabled :-(
   mv pytorch/bin/ffmpeg pytorch/bin/ffmpeg.conda
 fi
